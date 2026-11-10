@@ -1,0 +1,1 @@
+{ "place": "none", "title": "Station Search", "focusable": true, "overlay": { "kind": "dialog", "width": 800, "height": 600, "frame": "none" } }

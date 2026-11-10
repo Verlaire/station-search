@@ -1,0 +1,5 @@
+{
+  "global": {
+    "ctrl-shift-s": "mod.open:station-search"
+  }
+}
