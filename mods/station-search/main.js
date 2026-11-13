@@ -61,10 +61,11 @@ export default class Search extends View {
     this.key_ = null;
     this.detail = false;
     this.preview = { key: null, msgs: [], busy: false };
+    this.tasks = [];
     this.makeInput();
-    cx.timer.after(400, () => this.input.focus());
+    this.tasks.push(cx.timer.after(400, () => this.input.focus()));
     this.handle = cx.focus_handle();
-    cx.spawn(async (cx) => {
+    this.tasks.push(cx.spawn(async (cx) => {
       for (const name of ["python3", "python"]) {
         const r = await exec(name, ["-I", "-c", "import sys; print(sys.version_info[0])"]).catch(() => null);
         if (r?.code === 0 && r.stdout.trim() === "3") { this.py = name; break; }
@@ -76,8 +77,8 @@ export default class Search extends View {
       }
       this.key_ = null;
       cx.notify();
-    });
-    cx.spawn(async (cx) => {
+    }));
+    this.tasks.push(cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
         if (c.startsWith("query:")) { this.text = c.slice(6); cx.notify(); }
@@ -86,7 +87,11 @@ export default class Search extends View {
         if (c.startsWith("scroll:")) this.scroll(Number(c.slice(7)), cx);
         if (c.startsWith("lang:")) { setShared("station-search.lang", c.slice(5) || null); this.setLang(c.slice(5)); cx.notify(); }
       }
-    });
+    }));
+  }
+
+  close() {
+    for (const t of [...this.tasks, this.query, this.peek]) t?.cancel();
   }
 
   get t() { return TEXT[this.lang] ?? TEXT.en; }
@@ -122,9 +127,11 @@ export default class Search extends View {
     if (key === this.key_) return;
     this.key_ = key;
     const n = ++this.asked;
+    this.query?.cancel();
+    this.query = null;
     if (!this.text.trim()) { this.results = []; this.busy = false; return; }
     this.busy = true;
-    cx.spawn(async (cx) => {
+    this.query = cx.spawn(async (cx) => {
       await cx.sleep(250);
       if (n !== this.asked) return;
       const r = await exec(this.py, ["-I", SCRIPT(), "query", ...key.split(/\s+/)]).catch(() => null);
@@ -133,6 +140,7 @@ export default class Search extends View {
       this.selected = 0;
       this.detail = false;
       this.busy = false;
+      this.query = null;
       cx.notify();
     });
   }
@@ -143,8 +151,10 @@ export default class Search extends View {
     if (key === this.preview.key) return;
     this.preview = { key, msgs: [], busy: Boolean(key) };
     this.scrollY = 0;
+    this.peek?.cancel();
+    this.peek = null;
     if (!key) return;
-    cx.spawn(async (cx) => {
+    this.peek = cx.spawn(async (cx) => {
       const out = await exec(this.py, ["-I", SCRIPT(), "context", String(r.row), ...this.text.split(/\s+/).filter(Boolean)]).catch(() => null);
       if (this.preview.key !== key) return;
       try { this.preview.msgs = JSON.parse(out?.stdout || "[]"); } catch { this.preview.msgs = []; }
