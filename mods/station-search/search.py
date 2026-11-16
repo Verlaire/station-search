@@ -4,20 +4,78 @@
     python search.py query <text>             update, then print matches as JSON
     python search.py context <row> <text>     a match with the messages around it, as JSON
 
-Reads Claude Code (~/.claude/projects), Codex ($CODEX_HOME or ~/.codex) and Hermes Agent
-($HERMES_HOME or ~/.hermes). The index lives in ~/.cache/station-search/index.db
+Reads Claude Code, Codex, Hermes, Antigravity CLI, Pi and configured normalized exports.
+Live agents are discovered from Herdr without an allowlist. See docs/agents.md for source paths.
+The index lives in ~/.cache/station-search/index.db
 ($STATION_SEARCH_DB overrides it). Words are ANDed, prefix-matched and accent-blind.
-Filters: /claude /codex /hermes (agents), /open (only what's running now), #word (folder).
+Filters: /agent-id (any agent), /open (only what's running now), #word (folder).
 """
-import json, os, re, shutil, sqlite3, subprocess, sys, time, unicodedata
+import glob, json, os, re, shutil, sqlite3, subprocess, sys, time, unicodedata
+from contextlib import closing
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 HOME = Path.home()
 DB = Path(os.environ.get("STATION_SEARCH_DB") or HOME / ".cache" / "station-search" / "index.db")
 CLAUDE = HOME / ".claude"
 CODEX = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
 HERMES = Path(os.environ.get("HERMES_HOME") or HOME / ".hermes")
-AGENTS = ("claude", "codex", "hermes")
+ANTIGRAVITY = Path(os.environ.get("ANTIGRAVITY_HOME") or HOME / ".gemini/antigravity-cli")
+PI = Path(os.environ.get("PI_CODING_AGENT_DIR") or HOME / ".pi/agent")
+SOURCES = Path(os.environ.get("STATION_SEARCH_SOURCES") or HOME / ".config/station-search/sources.json")
+AGENTS = ("claude", "codex", "hermes", "antigravity", "pi")
+ALIASES = {"claude-code": "claude", "agy": "antigravity", "gemini-cli": "gemini", "pi-coding-agent": "pi"}
+NAMES = {"claude": "Claude", "codex": "Codex", "hermes": "Hermes", "antigravity": "Antigravity", "pi": "Pi"}
+
+
+def agent_id(value):
+    value = str(value or "terminal").lower()
+    return ALIASES.get(value, value)
+
+
+def terminal_agent(t):
+    status = t.get("status")
+    reported = status.get("app") if isinstance(status, dict) else None
+    value = reported or t.get("agent")
+    if not status and (not value or re.search(r"[\\/]|\.(exe|cmd)$", value, re.I)):
+        return "terminal"
+    return agent_id(value)
+
+
+def configured_sources():
+    if not SOURCES.exists():
+        return []
+    try:
+        data = json.loads(SOURCES.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("expected an array")
+        out = []
+        for source in data:
+            if not isinstance(source, dict) or not re.fullmatch(r"[a-z][a-z0-9_-]*", source.get("agent", "")):
+                raise ValueError("each source needs an agent id")
+            if source["agent"] in AGENTS:
+                raise ValueError("custom sources must use a distinct agent id")
+            if not isinstance(source.get("paths"), list) or not all(isinstance(p, str) for p in source["paths"]):
+                raise ValueError("paths must be an array of glob strings")
+            resume = source.get("resume", [])
+            if not isinstance(resume, list) or not all(isinstance(a, str) for a in resume):
+                raise ValueError("resume must be an argv array")
+            out.append(source)
+        return out
+    except (OSError, ValueError, TypeError) as error:
+        print(f"Station Search: custom sources unavailable: {error}", file=sys.stderr)
+        return []
+
+
+def readonly(path):
+    return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+
+
+def file_stamp(path):
+    stat = path.stat()
+    wal = Path(str(path) + "-wal")
+    base = f"{stat.st_mtime_ns}:{stat.st_size}"
+    return base + (f":{wal.stat().st_mtime_ns}:{wal.stat().st_size}" if wal.exists() else "")
 
 
 def hc_path():
@@ -43,6 +101,8 @@ def connect():
         create virtual table if not exists docs using fts5(text, agent unindexed, session unindexed,
             role unindexed, ts unindexed, path unindexed, tokenize = 'unicode61 remove_diacritics 2');
     """)
+    if "resume" not in {r[1] for r in db.execute("pragma table_info(sessions)")}:
+        db.execute("alter table sessions add column resume text")
     return db
 
 
@@ -58,9 +118,14 @@ def human(t):
     return t if t and not t.startswith("<") else ""
 
 
+def file_lines(path):
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        yield from handle
+
+
 def parse_claude(path):
     sid, cwd, rows = path.stem, None, []
-    for line in open(path, encoding="utf-8", errors="replace"):
+    for line in file_lines(path):
         try:
             d = json.loads(line)
         except ValueError:
@@ -78,7 +143,7 @@ def parse_claude(path):
 
 def parse_codex(path):
     sid, cwd, rows = None, None, []
-    for line in open(path, encoding="utf-8", errors="replace"):
+    for line in file_lines(path):
         try:
             d = json.loads(line)
         except ValueError:
@@ -94,46 +159,142 @@ def parse_codex(path):
     return sid or path.stem, cwd, rows
 
 
-def store(db, agent, path, sid, cwd, rows, title=None):
+def store(db, agent, path, sid, cwd, rows, title=None, resume=None):
     db.execute("delete from docs where path = ?", (str(path),))
     db.executemany("insert into docs (text, agent, session, role, ts, path) values (?, ?, ?, ?, ?, ?)",
                    [(t, agent, sid, role, ts, str(path)) for t, role, ts in rows])
     if rows:
         first = next((t for t, role, _ in rows if role == "user"), rows[0][0])
-        db.execute("insert or replace into sessions values (?, ?, ?, ?, ?)",
-                   (agent, sid, cwd, title or first.splitlines()[0][:120], max(ts for _, _, ts in rows)))
+        db.execute("insert or replace into sessions (agent, id, cwd, title, last, resume) values (?, ?, ?, ?, ?, ?)",
+                   (agent, sid, cwd, title or first.splitlines()[0][:120], max(ts for _, _, ts in rows), json.dumps(resume) if resume else None))
+
+
+def parse_pi(path):
+    sid, cwd, rows = path.stem, None, []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") == "session":
+            sid, cwd = entry.get("id") or sid, entry.get("cwd")
+        message = entry.get("message") or {}
+        if entry.get("type") == "message" and message.get("role") in ("user", "assistant"):
+            for body in texts(message.get("content")):
+                if human(body):
+                    rows.append((human(body), message["role"], entry.get("timestamp") or ""))
+    return sid, cwd, rows
+
+
+def parse_custom(path):
+    """Normalized JSON sessions or JSONL session/message records; no agent-specific guessing."""
+    if path.suffix == ".jsonl":
+        entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        head = next((e for e in entries if e.get("type") == "session"), {})
+        messages = [e.get("message", e) for e in entries if e.get("type") != "session"]
+    else:
+        head = json.loads(path.read_text(encoding="utf-8"))
+        messages = head.get("messages", [])
+    rows = []
+    for message in messages:
+        if message.get("role") not in ("user", "assistant"):
+            continue
+        for body in texts(message.get("content", message.get("text", ""))):
+            if human(body):
+                rows.append((human(body), message["role"], str(message.get("timestamp") or "")))
+    return str(head.get("id") or path.stem), head.get("cwd"), rows, head.get("title")
+
+
+def index_antigravity(db, path):
+    """Use Antigravity CLI's own readable full-text chunks, not its private protobuf payloads."""
+    db.execute("delete from docs where agent = 'antigravity'")
+    db.execute("delete from sessions where agent = 'antigravity'")
+    with closing(readonly(path)) as src:
+        rows = src.execute("""select f.conversation_id, f.chunk_index, f.last_step_created_at,
+            f.user_body, f.agent_body, s.title, s.workspace_uris
+            from conversations_fts f join conversation_summaries s
+            on s.conversation_id = f.conversation_id order by f.conversation_id, f.chunk_index""").fetchall()
+    grouped = {}
+    for sid, chunk, at, user, assistant, title, uris in rows:
+        if sid not in grouped:
+            workspace = (json.loads(uris or "[]") or [""])[0]
+            uri = urlparse(workspace)
+            cwd = unquote(uri.path) if uri.scheme == "file" else None
+            if cwd and re.match(r"^/[A-Za-z]:/", cwd):
+                cwd = cwd[1:]
+            if cwd and uri.netloc:
+                cwd = "//" + uri.netloc + cwd
+            grouped[sid] = {"cwd": cwd, "title": title, "rows": []}
+        for role, body in (("user", user), ("assistant", assistant)):
+            if body and human(body):
+                grouped[sid]["rows"].append((human(body), role, str(at or "")))
+    for sid, item in grouped.items():
+        store(db, "antigravity", f"antigravity:{sid}", sid, item["cwd"], item["rows"], item["title"], ["agy", "--conversation", sid])
 
 
 def index(db):
     seen = set()
     jobs = [("claude", p, parse_claude) for p in (CLAUDE / "projects").glob("*/*.jsonl")]
     jobs += [("codex", p, parse_codex) for p in (CODEX / "sessions").rglob("rollout-*.jsonl")]
+    jobs += [("pi", p, parse_pi) for p in (PI / "sessions").glob("*/*.jsonl")]
     for agent, path, parse in jobs:
-        st = path.stat()
-        stamp = f"{st.st_mtime_ns}:{st.st_size}"
         seen.add(str(path))
-        if db.execute("select stamp from files where path = ?", (str(path),)).fetchone() == (stamp,):
-            continue
-        sid, cwd, rows = parse(path)
-        store(db, agent, path, sid, cwd, rows)
-        db.execute("insert or replace into files values (?, ?)", (str(path), stamp))
-        db.commit()
+        def load(agent=agent, path=path, parse=parse):
+            sid, cwd, rows = parse(path)
+            resume = ["pi", "--session", str(path)] if agent == "pi" else None
+            store(db, agent, path, sid, cwd, rows, resume=resume)
+        update_source(db, str(path), path, load)
+    for source in configured_sources():
+        for pattern in source["paths"]:
+            for name in glob.iglob(os.path.expandvars(os.path.expanduser(pattern)), recursive=True):
+                path = Path(name)
+                if not path.is_file():
+                    continue
+                key = f"custom:{source['agent']}:{path}"
+                seen.add(key)
+                def load(source=source, path=path, key=key):
+                    sid, cwd, rows, title = parse_custom(path)
+                    resume = [arg.replace("{id}", sid).replace("{path}", str(path)) for arg in source.get("resume", [])]
+                    store(db, source["agent"], key, sid, cwd, rows, title, resume)
+                update_source(db, key, path, load, json.dumps(source, sort_keys=True))
+    for agent, path, loader in (("hermes", HERMES / "state.db", index_hermes),
+                                ("antigravity", ANTIGRAVITY / "conversation_summaries.db", index_antigravity)):
+        if path.exists():
+            seen.add(agent + ":")
+            update_source(db, agent + ":", path, lambda loader=loader, path=path: loader(db, path))
     for (gone,) in db.execute("select path from files").fetchall():
-        if gone not in seen and not gone.startswith("hermes:"):
-            db.execute("delete from docs where path = ?", (gone,))
+        if gone not in seen:
+            if gone in ("hermes:", "antigravity:"):
+                db.execute("delete from docs where agent = ?", (gone[:-1],))
+                db.execute("delete from sessions where agent = ?", (gone[:-1],))
+            else:
+                db.execute("delete from docs where path = ?", (gone,))
             db.execute("delete from files where path = ?", (gone,))
-    state = HERMES / "state.db"
-    if state.exists():
-        wal = HERMES / "state.db-wal"
-        stamp = f"{state.stat().st_mtime_ns}:{wal.stat().st_mtime_ns if wal.exists() else ''}"
-        if db.execute("select stamp from files where path = 'hermes:'").fetchone() != (stamp,):
-            index_hermes(db, state)
-            db.execute("insert or replace into files values ('hermes:', ?)", (stamp,))
     db.commit()
 
 
+def update_source(db, key, path, load, extra=""):
+    """A locked/corrupt source must not hide results from the other agents or destroy its last good index."""
+    try:
+        stamp = file_stamp(path) + extra
+        previous = db.execute("select stamp from files where path = ?", (key,)).fetchone()
+        if previous == (stamp,) or (path.suffix not in (".db", ".sqlite") and previous == (stamp + ":",)):
+            return
+        db.execute("savepoint source")
+        try:
+            load()
+            db.execute("insert or replace into files values (?, ?)", (key, stamp))
+        except Exception:
+            db.execute("rollback to source")
+            raise
+        finally:
+            db.execute("release source")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, sqlite3.Error) as error:
+        print(f"Station Search: skipped source {key}: {error}", file=sys.stderr)
+
+
 def index_hermes(db, state):
-    src = sqlite3.connect(f"file:{state}?mode=ro", uri=True)
+    src = readonly(state)
     db.execute("delete from docs where agent = 'hermes'")
     db.execute("delete from sessions where agent = 'hermes'")
     meta = {sid: (cwd, title) for sid, cwd, title in src.execute("select id, cwd, title from sessions")}
@@ -147,6 +308,7 @@ def index_hermes(db, state):
     for sid, rows in by.items():
         cwd, title = meta.get(sid, (None, None))
         store(db, "hermes", f"hermes:{sid}", sid, cwd, rows, title)
+    src.close()
 
 
 def parents():
@@ -182,7 +344,8 @@ def parents():
 
 
 def hc(*args):
-    return subprocess.run([HC, *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10).stdout
+    return subprocess.run([HC, *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+                          **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {})).stdout
 
 
 def terminals():
@@ -192,8 +355,10 @@ def terminals():
     for t in ts:
         if t.get("state") == "live":
             try:
-                out.append({**t, **json.loads(hc("get", t["address"], "--json"))})
-            except ValueError:
+                detail = {**t, **json.loads(hc("get", t["address"], "--json"))}
+                detail["cwd"] = (detail.get("foreground") or {}).get("cwd") or detail.get("cwd")
+                out.append(detail)
+            except (ValueError, OSError, subprocess.SubprocessError):
                 out.append(t)
     return out
 
@@ -230,14 +395,30 @@ def open_sessions(terms):
     for sid, name in thread_names().items():
         names.setdefault(name, sid)
     for t in terms:
-        if t.get("agent") == "codex" and t.get("title"):
+        if terminal_agent(t) == "codex" and t.get("title"):
             sid = names.get(t["title"].split(" | ")[0].strip())
             if sid:
                 found[("codex", sid)] = t["address"]
+        # CLI flags are stronger evidence than a title and also work for Antigravity/Pi.
+        argv = (t.get("foreground") or {}).get("argv") or []
+        for i, arg in enumerate(argv):
+            for flag, agent in (("--conversation", "antigravity"), ("--session", "pi")):
+                value = arg.split("=", 1)[1] if arg.startswith(flag + "=") else argv[i + 1] if arg == flag and i + 1 < len(argv) else None
+                if value and terminal_agent(t) == agent:
+                    if agent == "pi" and value.endswith(".jsonl"):
+                        # Pi accepts a session file as well as a session id.
+                        try:
+                            value = parse_pi(Path(value))[0]
+                        except OSError:
+                            continue
+                    found[(agent, value)] = t["address"]
     # Optional: a Hermes hook that records <session>.terminal files (see RECIPE.md).
     live = {t["address"] for t in terms}
     for f in (HERMES / "agent-hooks" / "state").glob("*.terminal"):
-        addr = f.read_text().strip()
+        try:
+            addr = f.read_text().strip()
+        except OSError:
+            continue
         if addr in live:
             found[("hermes", f.stem)] = addr
     return found
@@ -247,10 +428,13 @@ def fold(s):
     return "".join(c for c in unicodedata.normalize("NFD", s.lower()) if not unicodedata.combining(c))
 
 
-def live(terms, words, folder, skip):
+def live(terms, words, folder, skip, selected=()):
     words = [fold(w) for w in words]
     out = []
     for t in terms:
+        agent = terminal_agent(t)
+        if selected and agent not in selected:
+            continue
         if t["address"] in skip or (folder and folder not in (t.get("cwd") or "").lower()):
             continue
         try:
@@ -259,7 +443,6 @@ def live(terms, words, folder, skip):
             continue
         hits = [l.strip() for l in screen.splitlines() if all(w in fold(l) for w in words)]
         if hits:
-            agent = {"claude-code": "claude"}.get(t.get("agent"), t.get("agent")) if t.get("status") else "terminal"
             title = t.get("title") or ""
             if not title or re.match(r"^([A-Za-z]:[\\/]|/)", title):
                 title = (agent or "terminal").capitalize() if agent and agent != "terminal" else t["address"]
@@ -279,44 +462,64 @@ def query(text):
     agents, folder, words = [], None, []
     for tok in text.split():
         low = tok.lower()
-        if low.startswith("/") and low[1:] in AGENTS + ("open",):
-            agents.append(low[1:])
+        if re.fullmatch(r"/[a-z][a-z0-9_-]*", low):
+            agents.append(agent_id(low[1:]))
         elif low.startswith("#") and len(low) > 1:
             folder = low[1:]
         else:
             words.append(low)
     try:
         terms = terminals()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        terms = []
+    try:
         opened = open_sessions(terms)
     except Exception:
-        terms, opened = [], {}
+        opened = {}
     names = thread_names()
-    want = [a for a in agents if a in AGENTS] or list(AGENTS)
+    want = [a for a in agents if a != "open"]
     results = []
     if words:
+        restrict = f"and agent in ({','.join('?' * len(want))})" if want else ""
         rows = db.execute(f"""
             select agent, session, ts, snippet(docs, 0, '[', ']', '…', 14), rowid from docs
-            where docs match ? and agent in ({",".join("?" * len(want))})
+            where docs match ? {restrict}
             order by ts desc limit 3000""", [fts(words), *want]).fetchall()
         groups = {}
         for agent, sid, when, snip, rowid in rows:
             g = groups.setdefault((agent, sid), {"when": when, "snippet": " ".join(snip.split()), "hits": 0, "row": rowid})
             g["hits"] += 1
-        for (agent, sid), g in list(groups.items())[:60]:
-            cwd, title = db.execute("select cwd, title from sessions where agent = ? and id = ?", (agent, sid)).fetchone() or (None, None)
+        for (agent, sid), g in groups.items():
+            cwd, title, resume = db.execute("select cwd, title, resume from sessions where agent = ? and id = ?", (agent, sid)).fetchone() or (None, None, None)
             if folder and folder not in (cwd or "").lower():
                 continue
             if agent == "codex" and names.get(sid):
                 title = names[sid]
+            terminal = opened.get((agent, sid))
+            if "open" in agents and not terminal:
+                continue
             results.append({"kind": "session", "agent": agent, "session": sid, "cwd": cwd, "title": title or sid,
-                            "terminal": opened.get((agent, sid)), **g})
+                            "terminal": terminal, "resume": json.loads(resume) if resume else None, **g})
+            if len(results) >= 60:
+                break
     if "open" in agents:
         results = [r for r in results if r.get("terminal")]
-    if words and (not agents or "open" in agents):
+    if words:
         shown = {r["terminal"] for r in results if r.get("terminal")}
-        results = live(terms, words, folder, shown) + results
+        results = live(terms, words, folder, shown, want) + results
     results.sort(key=lambda r: not r.get("terminal"))
+    db.close()
     print(json.dumps(results, ensure_ascii=False))
+
+
+def catalog():
+    ids = set(AGENTS) | {s["agent"] for s in configured_sources()}
+    try:
+        ids.update(terminal_agent(t) for t in terminals())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    print(json.dumps([{"id": key, "name": NAMES.get(key, key.replace("-", " ").title())}
+                      for key in sorted(ids) if key != "terminal"], ensure_ascii=False))
 
 
 def context(row, text):
@@ -324,6 +527,7 @@ def context(row, text):
     db = connect()
     hit = db.execute("select agent, session from docs where rowid = ?", (row,)).fetchone()
     if not hit:
+        db.close()
         print("[]")
         return
     words = [w for w in text.split() if not w.startswith(("/", "#"))]
@@ -343,6 +547,7 @@ def context(row, text):
         else:
             body = body[:700] + ("…" if len(body) > 700 else "")
         out.append({"role": role, "when": ts, "text": body, "hit": rowid == row})
+    db.close()
     print(json.dumps(out, ensure_ascii=False))
 
 
@@ -364,9 +569,12 @@ if __name__ == "__main__":
     cmd = sys.argv[1:2]
     if cmd == ["lang"]:
         lang()
+    elif cmd == ["agents"]:
+        catalog()
     elif cmd == ["index"]:
         t = time.time()
-        index(connect())
+        with closing(connect()) as db:
+            index(db)
         print(f"indexed in {time.time() - t:.1f}s")
     elif cmd == ["query"]:
         query(" ".join(sys.argv[2:]))

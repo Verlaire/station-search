@@ -1,6 +1,6 @@
-// Station Search: every coding agent's conversations (Claude Code, Codex, Hermes) and the live
+// Station Search: built-in/configured conversation histories and every Herdr agent's live
 // terminals, in one place. search.py (next to this file) keeps an accent-blind full-text index.
-// Filters: /claude /codex /hermes /open, #folder. Click or Enter: go to it (its live terminal,
+// Filters: /agent-id /open, #folder. Click or Enter: go to it (its live terminal,
 // or resume it in a new tab). The chevron or → shows the match in its conversation; ← goes back.
 // ↑↓ move the keyboard from the field to the list; typing there goes back to the field.
 // Language: the system's (English or Spanish); shared("station-search.lang") overrides it.
@@ -9,35 +9,38 @@ import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
 import { props, closeOverlay, theme, run, exec, nextCommand, appHome, shared, setShared } from "herdr";
 
 const SCRIPT = () => `${appHome().replace(/\\/g, "/")}/mods/station-search/search.py`;
-const ICON = { claude: "icons/claude.svg", codex: "icons/codex.svg", hermes: "icons/hermes.svg" };
+const ICON = { claude: "icons/claude.svg", codex: "icons/codex.svg", hermes: "icons/hermes.svg", antigravity: "icons/antigravity.svg", pi: "icons/pi.svg" };
 const TINTED = new Set(["hermes"]);
-const NAME = { claude: "Claude", codex: "Codex", hermes: "Hermes", terminal: "Terminal" };
+const NAME = { claude: "Claude", codex: "Codex", hermes: "Hermes", antigravity: "Antigravity", pi: "Pi", terminal: "Terminal" };
 const RESUME = {
   claude: (id) => ["claude", "--resume", id],
   codex: (id) => ["codex", "resume", id],
   hermes: (id) => ["hermes", "--resume", id],
+  antigravity: (id) => ["agy", "--conversation", id],
 };
 
 const TEXT = {
   en: {
     placeholder: "Search every conversation…  (#folder to filter)", all: "All", open: "Open",
-    start: "Type to search Claude, Codex, Hermes and the open terminals.",
+    start: "Type to search all agents and open terminals.",
     none: "No results.", busy: "searching…", listKeys: "↑↓ pick · → view · Enter open · Esc close",
     detailKeys: "← back · Enter open · Esc back", live: "open", matches: (n) => `${n} matches`,
     toTerminal: "Go to terminal", resume: "Resume session", screen: "Match on the terminal's screen:",
-    you: "You", loading: "Loading…", locale: "en-US",
+    you: "You", loading: "Loading…", previewOnly: "Read-only history", locale: "en-US",
     ago: (n, u) => `${n}${{ m: "m", h: "h", d: "d" }[u]} ago`,
     noPython: "Station Search needs Python 3 (python3 or python on PATH).",
+    searchError: "Search could not finish. Check Python, source access and the local index, then retry.",
   },
   es: {
     placeholder: "Buscar en todas las conversaciones…  (#carpeta para filtrar)", all: "Todo", open: "Abiertas",
-    start: "Escribí algo para buscar en Claude, Codex, Hermes y las terminales abiertas.",
+    start: "Escribí algo para buscar en todos los agentes y las terminales abiertas.",
     none: "Sin resultados.", busy: "buscando…", listKeys: "↑↓ elegir · → ver · Enter abrir · Esc cerrar",
     detailKeys: "← volver · Enter abrir · Esc volver", live: "abierta", matches: (n) => `${n} coincidencias`,
     toTerminal: "Ir a la terminal", resume: "Retomar sesión", screen: "Coincidencia en la pantalla de la terminal:",
-    you: "Vos", loading: "Cargando…", locale: "es-AR",
+    you: "Vos", loading: "Cargando…", previewOnly: "Historial de solo lectura", locale: "es-AR",
     ago: (n, u) => `hace ${n} ${{ m: "min", h: "h", d: "d" }[u]}`,
     noPython: "Station Search necesita Python 3 (python3 o python en el PATH).",
+    searchError: "No se pudo completar la búsqueda. Revisá Python, los permisos de las fuentes y el índice local; luego reintentá.",
   },
 };
 
@@ -55,8 +58,10 @@ export default class Search extends View {
     this.text = "";
     this.filter = "";
     this.results = [];
+    this.agentTypes = Object.entries(NAME).filter(([id]) => id !== "terminal").map(([id, name]) => ({ id, name }));
     this.selected = 0;
     this.busy = false;
+    this.failure = false;
     this.asked = 0;
     this.key_ = null;
     this.detail = false;
@@ -71,6 +76,10 @@ export default class Search extends View {
         if (r?.code === 0 && r.stdout.trim() === "3") { this.py = name; break; }
       }
       this.py ??= false;
+      if (this.py) {
+        const catalog = await exec(this.py, ["-I", SCRIPT(), "agents"]).catch(() => null);
+        try { this.agentTypes = JSON.parse(catalog?.stdout || "null") ?? this.agentTypes; } catch {}
+      }
       if (this.py && !shared("station-search.lang")) {
         const r = await exec(this.py, ["-I", SCRIPT(), "lang"]).catch(() => null);
         this.setLang(r?.stdout.trim());
@@ -81,7 +90,7 @@ export default class Search extends View {
     this.tasks.push(cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
-        if (c.startsWith("query:")) { this.text = c.slice(6); cx.notify(); }
+        if (c.startsWith("query:")) { this.text = c.slice(6); this.input.set_value(this.text); cx.notify(); }
         if (c.startsWith("select:")) { this.selected = Number(c.slice(7)); cx.notify(); }
         if (c === "detail") { this.detail = true; cx.notify(); }
         if (c.startsWith("scroll:")) this.scroll(Number(c.slice(7)), cx);
@@ -101,7 +110,7 @@ export default class Search extends View {
     this.input?.release?.();
     this.input = InputState.new({ value: this.text, placeholder: this.t.placeholder });
     this.input.on("change", (_e, cx) => { this.text = this.input.value(); cx.notify(); });
-    this.input.on("submit", () => this.open(this.results[this.selected]));
+    this.input.on("submit", (_e, cx) => this.open(this.results[this.selected], cx));
     this.input.focus();
   }
 
@@ -131,12 +140,22 @@ export default class Search extends View {
     this.query = null;
     if (!this.text.trim()) { this.results = []; this.busy = false; return; }
     this.busy = true;
+    this.failure = false;
     this.query = cx.spawn(async (cx) => {
       await cx.sleep(250);
       if (n !== this.asked) return;
-      const r = await exec(this.py, ["-I", SCRIPT(), "query", ...key.split(/\s+/)]).catch(() => null);
+      const r = await exec(this.py, ["-I", SCRIPT(), "query", ...key.split(/\s+/)], { timeout: 600000 }).catch(() => null);
       if (n !== this.asked) return;
-      try { this.results = JSON.parse(r?.stdout || "[]"); } catch { this.results = []; }
+      try {
+        const rows = JSON.parse(r?.stdout || "null");
+        if (r?.code !== 0 || !Array.isArray(rows)) throw new Error("search failed");
+        this.results = rows;
+      } catch { this.results = []; this.failure = true; }
+      for (const result of this.results) {
+        if (result.agent !== "terminal" && !this.agentTypes.some((a) => a.id === result.agent)) {
+          this.agentTypes.push({ id: result.agent, name: NAME[result.agent] ?? result.agent });
+        }
+      }
       this.selected = 0;
       this.detail = false;
       this.busy = false;
@@ -163,11 +182,16 @@ export default class Search extends View {
     });
   }
 
-  open(r) {
+  open(r, cx) {
     if (!r) return;
+    const argv = r.resume ?? RESUME[r.agent]?.(r.session);
+    if (!r.terminal && !argv?.length) {
+      this.selected = this.results.indexOf(r);
+      this.show(true, cx);
+      return;
+    }
     closeOverlay(props()?.overlay);
     if (r.terminal) return run("agent.focus", { terminal: r.terminal });
-    const argv = RESUME[r.agent]?.(r.session);
     if (argv) run("tab.new", { name: (r.title || NAME[r.agent]).slice(0, 40), folder: r.cwd || undefined, argv });
   }
 
@@ -189,7 +213,7 @@ export default class Search extends View {
       cx.notify();
     } else if (listing && e.key === "right") this.show(true, cx);
     else if (listing && e.key === "left") this.show(false, cx);
-    else if (listing && e.key === "enter") this.open(this.results[this.selected]);
+    else if (listing && e.key === "enter") this.open(this.results[this.selected], cx);
     else if (listing && (e.key === "backspace" || (e.key_char && !e.modifiers?.control && !e.modifiers?.alt))) {
       const next = e.key === "backspace" ? this.text.slice(0, -1) : this.text + e.key_char;
       this.input.set_value(next);
@@ -220,7 +244,7 @@ export default class Search extends View {
     const meta = [NAME[r.agent] ?? r.agent, where, r.kind === "live" ? "" : this.ago(r.when), r.hits > 1 ? this.t.matches(r.hits) : ""].filter(Boolean).join(" · ");
     return h_flex().id(`r-${i}`).w_full().pl(10).py(7).gap(9).items_start().rounded(8).cursor_pointer()
       .bg(on ? t.selected : t.popover).hover((s) => s.bg(on ? t.selected : t.hover))
-      .on_click(() => this.open(r))
+      .on_click((_e, cx) => this.open(r, cx))
       .child(div().flex_none().pt(2).child(this.icon(r.agent, t)))
       .child(v_flex().flex_1().min_w(0).gap(2)
         .child(h_flex().gap(8).min_w(0)
@@ -248,7 +272,7 @@ export default class Search extends View {
       .child(div().flex_1().min_w(0).truncate().text_size(13).font_semibold().child(r.title || ""))
       .child(div().id("open").flex_none().px(10).py(4).rounded(6).text_size(12).cursor_pointer()
         .bg(t.solid).text_color(t.solid_foreground).hover((s) => s.opacity(0.88))
-        .on_click(() => this.open(r)).child(r.terminal ? this.t.toTerminal : this.t.resume));
+        .on_click((_e, cx) => this.open(r, cx)).child(r.terminal ? this.t.toTerminal : (r.resume?.length || RESUME[r.agent]) ? this.t.resume : this.t.previewOnly));
     if (r.kind === "live") {
       return v_flex().size_full().gap(10).child(head)
         .child(div().text_size(12.5).text_color(t.muted).child(this.t.screen))
@@ -280,14 +304,14 @@ export default class Search extends View {
     this.ask(cx);
     this.look(cx);
     const t = theme(), s = this.t;
-    const filters = [["", s.all], ["/claude", "Claude"], ["/codex", "Codex"], ["/hermes", "Hermes"], ["/open", s.open]];
+    const filters = [["", s.all], ...this.agentTypes.map(({ id, name }) => [`/${id}`, name]), ["/open", s.open]];
     const chip = ([token, label]) => {
       const on = this.filter === token;
       return div().id(`f-${token || "all"}`).px(10).py(3).rounded(6).text_size(12).cursor_pointer()
         .bg(on ? t.selected : t.popover).text_color(on ? t.foreground : t.muted).hover((st) => st.bg(t.hover))
         .on_click((_e, cx) => { this.filter = token; cx.notify(); }).child(label);
     };
-    const empty = this.py === false ? s.noPython : !this.text.trim() ? s.start : s.none;
+    const empty = this.py === false ? s.noPython : !this.text.trim() ? s.start : this.failure ? s.searchError : s.none;
     // The overlay keeps its full size and draws no frame; the card hugs its content at the top,
     // so the field never moves while results come and go.
     const card = v_flex().w_full().flex_none().p(14).gap(10).bg(t.popover).text_color(t.foreground)
@@ -300,9 +324,8 @@ export default class Search extends View {
             .hover((st) => st.text_color(t.foreground))
             .on_click((_e, cx) => { setShared("station-search.lang", code); this.setLang(code); cx.notify(); })
             .child(code.toUpperCase())))))
-      .child(h_flex().flex_none().gap(4).items_center().children(filters.map(chip))
-        .child(div().flex_1())
-        .child(div().text_size(11).text_color(t.dim).child(this.busy ? s.busy : this.detail ? s.detailKeys : s.listKeys)))
+      .child(h_flex().flex_none().flex_wrap().gap(4).items_center().children(filters.map(chip)))
+      .child(div().text_size(11).text_color(t.dim).child(this.busy ? s.busy : this.detail ? s.detailKeys : s.listKeys))
       .child(this.detail
         ? div().h(460).child(this.side(t))
         : v_flex().id("results").max_h(460).gap(2).overflow_y_scrollbar()
