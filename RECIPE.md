@@ -24,6 +24,11 @@ change, and the field jumps).
 - **Filter row**: wrapping text chips All, discovered agents (including Antigravity and Pi),
   and Open (12px; the picked one on `selected`). Put the 11px `dim` keys hint on its own
   row below, so a growing agent catalog does not squeeze the search field.
+  A single rounded selected-color indicator slides behind the effective filter, including
+  filters typed into the field and their aliases. Measure chip sizes and wrapping width,
+  convert from app-zoomed measurements to builder units, and preserve text/hit targets above
+  the indicator. Use native 160ms ease-out transitions, with no timers or input blocking.
+  `station-search.motion:off` selects an instant update through shared reduced-motion state.
 - **Results**: rows 7px tall padding, 8px radius, the picked one on `selected`, hover `hover`.
   Each row: the agent's 16px icon (Herdr's `icons/<agent>.svg`; Hermes' is one color, drawn in
   `foreground`), the title (13px, medium, truncated), an "open" badge (10.5px `accent` on
@@ -115,6 +120,8 @@ without Python 3, what's missing.
 - `keys.json`: `ctrl-shift-s` → `mod.open:station-search` (`keys.macos.json`: `cmd-shift-s`).
 - **Dev hooks** (`herdr-app do station-search.<x>`): `query:<text>`, `select:<n>`, `detail`,
   `scroll:<px>`, `lang:<code>`.
+  `motion:off|on` controls reduced motion for the filter indicator. Typing a filter only
+  changes its visual reflection; it does not rewrite query text or change search semantics.
 
 ## Watch out
 
@@ -166,3 +173,6 @@ without Python 3, what's missing.
 - Run `node tests/test_results_scroll.cjs`, then verify a long list in the running app: arrows
   reveal selections below/above the viewport; wheel scrolling stays independent of selection;
   returning from preview reveals the selected result without enlarging the dialog.
+- Run `node tests/test_filter_chips.cjs`; in the app, typing `/claude` or `/agy` moves the
+  indicator to the right chip, removing the filter returns it to All, and reduced motion
+  updates the selected state without sliding.
