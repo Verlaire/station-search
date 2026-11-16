@@ -60,6 +60,11 @@ export default class Search extends View {
     this.results = [];
     this.agentTypes = Object.entries(NAME).filter(([id]) => id !== "terminal").map(([id, name]) => ({ id, name }));
     this.selected = 0;
+    this.resultHeights = [];
+    this.resultsY = 0;
+    this.resultsScale = 1;
+    this.followSelection = true;
+    this.revealResult = false;
     this.busy = false;
     this.failure = false;
     this.asked = 0;
@@ -91,9 +96,15 @@ export default class Search extends View {
       for (;;) {
         const c = await nextCommand();
         if (c.startsWith("query:")) { this.text = c.slice(6); this.input.set_value(this.text); cx.notify(); }
-        if (c.startsWith("select:")) { this.selected = Number(c.slice(7)); cx.notify(); }
+        if (c.startsWith("select:")) { this.selectResult(Number(c.slice(7))); cx.notify(); }
+        if (c === "metrics") setShared("station-search.metrics", { count: this.results.length, selected: this.selected,
+          y: this.resultsY, body: this.resultsBodyH, viewport: this.resultsViewH, rows: this.resultHeights });
+        if (c === "metrics:clear") setShared("station-search.metrics", null);
         if (c === "detail") { this.detail = true; cx.notify(); }
-        if (c.startsWith("scroll:")) this.scroll(Number(c.slice(7)), cx);
+        if (c.startsWith("scroll:")) {
+          if (this.detail) this.scroll(Number(c.slice(7)), cx);
+          else this.scrollResults(Number(c.slice(7)), cx);
+        }
         if (c.startsWith("lang:")) { setShared("station-search.lang", c.slice(5) || null); this.setLang(c.slice(5)); cx.notify(); }
       }
     }));
@@ -157,6 +168,9 @@ export default class Search extends View {
         }
       }
       this.selected = 0;
+      this.resultsY = 0;
+      this.followSelection = true;
+      this.revealResult = true;
       this.detail = false;
       this.busy = false;
       this.query = null;
@@ -197,7 +211,35 @@ export default class Search extends View {
 
   show(on, cx) {
     this.detail = on && Boolean(this.results[this.selected]);
+    if (!this.detail) { this.followSelection = true; this.revealResult = true; }
     cx.notify();
+  }
+
+  selectResult(index) {
+    if (!Number.isFinite(index)) return;
+    this.selected = Math.max(0, Math.min(this.results.length - 1, Math.trunc(index)));
+    this.followSelection = true;
+    this.revealResult = true;
+  }
+
+  scrollResults(by, cx, manual = true) {
+    if (manual) { this.followSelection = false; this.revealResult = false; }
+    const max = Math.max(0, (this.resultsBodyH ?? 0) - (this.resultsViewH ?? 0));
+    const next = Math.max(0, Math.min(max, this.resultsY + by));
+    if (next !== this.resultsY) { this.resultsY = next; cx.notify(); }
+  }
+
+  revealSelectedResult() {
+    if (this.detail || !this.revealResult || !this.results.length || !this.resultsViewH || !this.resultsBodyH) return;
+    let top = 0;
+    for (let i = 0; i <= this.selected; i++) {
+      if (this.resultHeights[i] == null) return; // Wait for actual layout measurements.
+      if (i < this.selected) top += this.resultHeights[i] + 2 * this.resultsScale;
+    }
+    const bottom = top + this.resultHeights[this.selected];
+    const next = top < this.resultsY ? top : bottom > this.resultsY + this.resultsViewH ? bottom - this.resultsViewH : this.resultsY;
+    this.resultsY = Math.max(0, Math.min(Math.max(0, this.resultsBodyH - this.resultsViewH), next));
+    this.revealResult = false;
   }
 
   key(e, cx) {
@@ -208,7 +250,7 @@ export default class Search extends View {
       cx.stop_propagation();
     } else if (e.key === "down" || e.key === "up") {
       if (this.detail) this.scroll(e.key === "down" ? 60 : -60, cx);
-      else this.selected = Math.max(0, Math.min(this.results.length - 1, this.selected + (e.key === "down" ? 1 : -1)));
+      else this.selectResult(this.selected + (e.key === "down" ? 1 : -1));
       this.handle.focus();
       cx.notify();
     } else if (listing && e.key === "right") this.show(true, cx);
@@ -242,7 +284,13 @@ export default class Search extends View {
     const on = i === this.selected;
     const where = (r.cwd ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "";
     const meta = [NAME[r.agent] ?? r.agent, where, r.kind === "live" ? "" : this.ago(r.when), r.hits > 1 ? this.t.matches(r.hits) : ""].filter(Boolean).join(" · ");
-    return h_flex().id(`r-${i}`).w_full().pl(10).py(7).gap(9).items_start().rounded(8).cursor_pointer()
+    return h_flex().id(`r-${i}`).w_full().flex_none().pl(10).py(7).gap(9).items_start().rounded(8).cursor_pointer()
+      .on_size_change((size, cx) => {
+        if (this.resultHeights[i] === size.height) return;
+        this.resultHeights[i] = size.height;
+        if (this.followSelection) this.revealResult = true;
+        cx.notify();
+      })
       .bg(on ? t.selected : t.popover).hover((s) => s.bg(on ? t.selected : t.hover))
       .on_click((_e, cx) => this.open(r, cx))
       .child(div().flex_none().pt(2).child(this.icon(r.agent, t)))
@@ -293,7 +341,7 @@ export default class Search extends View {
           .children(msgs)));
   }
 
-  // The preview scrolls by hand (only virtual lists scroll from code): ↑↓, the wheel.
+  // The Markdown preview has its own measured scroll position, separate from the results.
   scroll(by, cx) {
     const max = Math.max(0, (this.bodyH ?? 0) - (this.viewH ?? 0));
     const next = Math.max(0, Math.min(max, (this.scrollY ?? 0) + by));
@@ -303,6 +351,7 @@ export default class Search extends View {
   render(cx) {
     this.ask(cx);
     this.look(cx);
+    this.revealSelectedResult();
     const t = theme(), s = this.t;
     const filters = [["", s.all], ...this.agentTypes.map(({ id, name }) => [`/${id}`, name]), ["/open", s.open]];
     const chip = ([token, label]) => {
@@ -317,6 +366,15 @@ export default class Search extends View {
     const card = v_flex().w_full().flex_none().p(14).gap(10).bg(t.popover).text_color(t.foreground)
       .rounded(12).border_1().border_color(t.border).shadow_lg()
       .child(h_flex().flex_none().h(38).pr(6).gap(6).items_center().rounded(9).border_1().border_color(t.accent).bg(t.background)
+        .on_size_change((size, cx) => {
+          // Layout measurements include app zoom; builder lengths are scaled by it again.
+          const scale = size.height / 38;
+          if (scale > 0 && Math.abs(scale - this.resultsScale) > 0.0001) {
+            this.resultsScale = scale;
+            if (this.followSelection) this.revealResult = true;
+            cx.notify();
+          }
+        })
         .child(Input.new(this.input).flex_1().min_w(0).h_full().px(10).border_0().bg(t.background).text_size(13.5))
         .child(h_flex().flex_none().p(2).gap(2).rounded(6).bg(t.raised).children(Object.keys(TEXT).map((code) =>
           div().id(`lang-${code}`).px(6).py(1).rounded(4).text_size(10.5).font_semibold().cursor_pointer()
@@ -328,11 +386,26 @@ export default class Search extends View {
       .child(div().text_size(11).text_color(t.dim).child(this.busy ? s.busy : this.detail ? s.detailKeys : s.listKeys))
       .child(this.detail
         ? div().h(460).child(this.side(t))
-        : v_flex().id("results").max_h(460).gap(2).overflow_y_scrollbar()
+        : v_flex().id("results").flex_none().max_h(460).overflow_hidden()
+          .when(this.resultsBodyH != null, (el) => el.h(Math.min(460, this.resultsBodyH / this.resultsScale)))
+          .on_size_change((size, cx) => {
+            this.resultsViewH = size.height;
+            if (this.followSelection) this.revealResult = true;
+            this.scrollResults(0, cx, false);
+            cx.notify();
+          })
+          .on_scroll_wheel((event, cx) => { this.scrollResults(-event.delta.y, cx); cx.stop_propagation(); })
+          .child(v_flex().id("results-body").w_full().flex_none().gap(2).mt(-this.resultsY / this.resultsScale)
+          .on_size_change((size, cx) => {
+            this.resultsBodyH = size.height;
+            if (this.followSelection) this.revealResult = true;
+            this.scrollResults(0, cx, false);
+            cx.notify();
+          })
           .when(this.results.length === 0 && this.busy, (el) => el.child(h_flex().w_full().py(28).justify_center()
             .child(svg("mods/workspace-chrome/spinner.svg").size(22).text_color(t.accent).spin(900))))
           .when(this.results.length === 0 && !this.busy, (el) => el.child(div().p(20).text_size(12.5).text_color(t.dim).child(empty)))
-          .children(this.results.map((r, i) => this.row(r, i, t))));
+          .children(this.results.map((r, i) => this.row(r, i, t)))));
     return v_flex().id("station-search").track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
       .size_full().px(10).pt(4).child(card);
   }

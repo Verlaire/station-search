@@ -55,6 +55,11 @@ without Python 3, what's missing.
   Configured source argv is optional and is never executed during discovery/indexing.
 - **Chevron or →** opens the conversation; **‹, ← or Esc** goes back. **↑↓** pick a result, or
   scroll the conversation 60px at a time (the wheel too).
+- The results viewport keeps its existing 460px maximum. Rows are non-shrinking so overflow
+  is real. Measure row heights and the content/viewport heights with `on_size_change`; keep
+  a clamped result offset and move the inner column by its negative top margin. Wheel/trackpad
+  events adjust this offset. Reveal the selected row after keyboard navigation, new results,
+  or returning from preview. Do not reveal it on every redraw: that fights wheel scrolling.
 - **Keyboard focus**: while the field has it, ← → move the caret. ↑↓ hand the keyboard to the
   list (a focus handle on the root); typing or Backspace there hands it back to the field with
   the character added.
@@ -117,8 +122,16 @@ without Python 3, what's missing.
   `render` notices the new query and spawns the search (keyed, so it runs once).
 - `snippet()` can't be used with `GROUP BY` in FTS5: fetch matching rows newest first and group
   in Python.
-- Only virtual lists scroll from code, and messages have different heights: the conversation
-  scrolls by hand (an `overflow_hidden` box, a negative top margin, sizes from `on_size_change`).
+- Results use an `overflow_hidden()` viewport with a measured inner column. The viewport,
+  inner column and result rows use `flex_none()`; shrinking rows removes scrollable overflow.
+  Selection reveal waits for row measurements, includes the 2px row gaps, and moves only enough
+  to expose the selected row. Wheel scrolling disables selection-follow until the next keyboard
+  selection. The conversation has its own measured offset; do not share those scroll positions.
+  Measurements include app zoom: derive the effective scale from the known 38px search-field
+  height. Convert measured offsets/heights back to builder units, and scale row gaps when
+  comparing them with measured heights. Otherwise zoom applies twice and leaves a blank tail.
+  A plain overflow area's ScrollHandle passed its API check but failed the live selection
+  test on the target Herdr build; verify actual scrolling instead of relying on that check.
 - `terminal.search` takes no arguments and doesn't open from a mod, and full-screen agents keep
   old messages out of the terminal's scrollback, so jumping to a match inside a terminal can't
   be done: the inline conversation is the answer.
@@ -150,3 +163,6 @@ without Python 3, what's missing.
   `/agent-id /open #folder` narrows those results without leaking other agents into them.
 - Normalized exports work without changing the mod; absent resume argv keeps them read-only.
 - Run `python -I tests/test_search.py -v`: tests use synthetic histories and temporary indexes.
+- Run `node tests/test_results_scroll.cjs`, then verify a long list in the running app: arrows
+  reveal selections below/above the viewport; wheel scrolling stays independent of selection;
+  returning from preview reveals the selected result without enlarging the dialog.
