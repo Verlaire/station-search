@@ -12,6 +12,7 @@ const SCRIPT = () => `${appHome().replace(/\\/g, "/")}/mods/station-search/searc
 const ICON = { claude: "icons/claude.svg", codex: "icons/codex.svg", hermes: "icons/hermes.svg", antigravity: "icons/antigravity.svg", pi: "icons/pi.svg" };
 const TINTED = new Set(["hermes"]);
 const NAME = { claude: "Claude", codex: "Codex", hermes: "Hermes", antigravity: "Antigravity", pi: "Pi", terminal: "Terminal" };
+const FILTER_ALIASES = { "claude-code": "claude", agy: "antigravity", "gemini-cli": "gemini", "pi-coding-agent": "pi" };
 const RESUME = {
   claude: (id) => ["claude", "--resume", id],
   codex: (id) => ["codex", "resume", id],
@@ -59,6 +60,8 @@ export default class Search extends View {
     this.filter = "";
     this.results = [];
     this.agentTypes = Object.entries(NAME).filter(([id]) => id !== "terminal").map(([id, name]) => ({ id, name }));
+    this.filterSizes = {};
+    this.filterWidth = 0;
     this.selected = 0;
     this.resultHeights = [];
     this.resultsY = 0;
@@ -106,6 +109,7 @@ export default class Search extends View {
           else this.scrollResults(Number(c.slice(7)), cx);
         }
         if (c.startsWith("lang:")) { setShared("station-search.lang", c.slice(5) || null); this.setLang(c.slice(5)); cx.notify(); }
+        if (c.startsWith("motion:")) { setShared("station-search.reduce-motion", c.slice(7) === "off"); cx.notify(); }
       }
     }));
   }
@@ -115,6 +119,37 @@ export default class Search extends View {
   }
 
   get t() { return TEXT[this.lang] ?? TEXT.en; }
+
+  activeFilter(filters) {
+    const available = new Set(filters.map(([token]) => token));
+    const agents = new Set();
+    let open = false;
+    for (const word of `${this.filter} ${this.text}`.toLowerCase().split(/\s+/)) {
+      if (!/^\/[a-z][a-z0-9_-]*$/.test(word)) continue;
+      const id = FILTER_ALIASES[word.slice(1)] ?? word.slice(1);
+      if (id === "open") open = true;
+      else if (available.has(`/${id}`)) agents.add(`/${id}`);
+    }
+    // A single pill cannot represent a union of several agents as one specific agent.
+    return agents.size === 1 ? [...agents][0] : agents.size > 1 ? "" : open ? "/open" : "";
+  }
+
+  filterIndicator(filters, active) {
+    if (!this.filterWidth) return null;
+    let left = 0, top = 0, rowHeight = 0;
+    for (const [token] of filters) {
+      const size = this.filterSizes[token];
+      if (!size) return null;
+      const width = size.width / this.resultsScale, height = size.height / this.resultsScale;
+      if (left > 0 && left + width > this.filterWidth / this.resultsScale + 0.5) {
+        left = 0; top += rowHeight + 4; rowHeight = 0;
+      }
+      if (token === active) return { left, top, width, height };
+      left += width + 4;
+      rowHeight = Math.max(rowHeight, height);
+    }
+    return null;
+  }
 
   // The field is rebuilt when the language changes, so its placeholder follows.
   makeInput() {
@@ -354,10 +389,18 @@ export default class Search extends View {
     this.revealSelectedResult();
     const t = theme(), s = this.t;
     const filters = [["", s.all], ...this.agentTypes.map(({ id, name }) => [`/${id}`, name]), ["/open", s.open]];
+    const active = this.activeFilter(filters), indicator = this.filterIndicator(filters, active);
+    const reducedMotion = shared("station-search.reduce-motion") === true;
     const chip = ([token, label]) => {
-      const on = this.filter === token;
-      return div().id(`f-${token || "all"}`).px(10).py(3).rounded(6).text_size(12).cursor_pointer()
-        .bg(on ? t.selected : t.popover).text_color(on ? t.foreground : t.muted).hover((st) => st.bg(t.hover))
+      const on = active === token;
+      return div().id(`f-${token || "all"}`).flex_none().px(10).py(3).rounded(6).text_size(12).cursor_pointer()
+        .on_size_change((size, cx) => {
+          const old = this.filterSizes[token];
+          if (old?.width === size.width && old?.height === size.height) return;
+          this.filterSizes[token] = size; cx.notify();
+        })
+        .bg(on && !indicator ? t.selected : "#00000000").text_color(on ? t.foreground : t.muted)
+        .hover((st) => st.bg(on ? "#00000000" : t.hover))
         .on_click((_e, cx) => { this.filter = token; cx.notify(); }).child(label);
     };
     const empty = this.py === false ? s.noPython : !this.text.trim() ? s.start : this.failure ? s.searchError : s.none;
@@ -382,7 +425,18 @@ export default class Search extends View {
             .hover((st) => st.text_color(t.foreground))
             .on_click((_e, cx) => { setShared("station-search.lang", code); this.setLang(code); cx.notify(); })
             .child(code.toUpperCase())))))
-      .child(h_flex().flex_none().flex_wrap().gap(4).items_center().children(filters.map(chip)))
+      .child(h_flex().id("filter-chips").w_full().relative().flex_none().flex_wrap().gap(4).items_center()
+        .on_size_change((size, cx) => {
+          if (this.filterWidth === size.width) return;
+          this.filterWidth = size.width; cx.notify();
+        })
+        .when(Boolean(indicator), (el) => el.child(div().id("filter-indicator").absolute()
+          .left(indicator.left).top(indicator.top).w(indicator.width).h(indicator.height).rounded(6).bg(t.selected)
+          .when(!reducedMotion, (pill) => pill
+            .transition("left", { duration: 160, easing: "ease-out" })
+            .transition("top", { duration: 160, easing: "ease-out" })
+            .transition("width", { duration: 160, easing: "ease-out" }))))
+        .children(filters.map(chip)))
       .child(div().text_size(11).text_color(t.dim).child(this.busy ? s.busy : this.detail ? s.detailKeys : s.listKeys))
       .child(this.detail
         ? div().h(460).child(this.side(t))

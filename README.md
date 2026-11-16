@@ -96,6 +96,8 @@ While the search field has focus, ← and → move its caret. Press ↑ or ↓ t
 
 Agent filters select both the corresponding saved history and available live terminal text. `/open` combines with an agent or folder filter. Unknown agents get a generic icon and can be filtered without a code change. Live text is limited to what `hc` exposes; archived formats require a built-in reader or [configured export](docs/agents.md). Detecting every open agent does not imply access to every agent's private historical storage.
 
+Typing an exact agent filter moves the highlighted chip to that agent, including aliases such as `/agy`. The indicator follows your input immediately, before search finishes. Combined searches for multiple agents use All; adding `/open` to one agent keeps that agent highlighted. The movement is native and can be disabled with `herdr-app do station-search.motion:off` (`motion:on` enables it again).
+
 <details>
 <summary><b>Actual screenshot</b></summary>
 
