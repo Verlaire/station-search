@@ -1,7 +1,7 @@
 <h1 align="center">Station Search</h1>
 
 <p align="center"><b>Find the conversation. Keep the context.</b><br>
-One search box for Claude Code, Codex, Hermes Agent and open terminals.<br>
+One search box for all agents and open terminals.<br>
 A native mod for the <a href="https://herdr.dev">Herdr desktop app</a>.</p>
 
 <p align="center">
@@ -22,12 +22,12 @@ You remember the fix, a phrase or the project, but not which agent you discussed
 
 | Feature | What you get |
 | --- | --- |
-| **One search box** | Search saved Claude Code, Codex and Hermes Agent conversations, plus the screen and scrollback exposed by open Herdr terminals. |
+| **One search box** | Detect any agent exposed by Herdr and search its available live terminal text. Built-in history readers support Claude Code, Codex, Hermes Agent, Antigravity CLI and Pi; additional histories can be connected through normalized exports. |
 | **Local full-text index** | SQLite FTS5 with case-insensitive, accent-insensitive prefix matching. Multiple words must match; `como` can find `cómo`. |
 | **Highlighted results** | Conversation titles, agent, project folder, relative time, matching snippets and available match counts. Recognized running sessions show an open badge and appear first. |
-| **Context before switching** | Preview the matching message and up to two indexed messages on either side, rendered as selectable Markdown. Long messages are trimmed. |
+| **Context before switching** | Preview the matching indexed record and up to two neighboring records, rendered as selectable Markdown. Antigravity exposes user/agent text chunks through its native index; long records are trimmed. |
 | **Jump or resume** | Focus an open session's terminal, or resume a saved conversation in a new tab through its agent CLI. |
-| **Agent & folder filters** | Narrow results to Claude, Codex, Hermes, open terminals or a folder without leaving the search field. |
+| **Agent & folder filters** | Filters discover agents from Herdr and configured history sources instead of using a closed list. Use `/antigravity`, `/pi`, any discovered `/agent-id`, `/open` or `#folder`. |
 | **Keyboard navigation** | Pick results, open previews, return to the list and jump into a session. |
 | **English & Spanish** | Follow the system language or choose EN / ES inside the search field. |
 
@@ -87,11 +87,14 @@ While the search field has focus, ← and → move its caret. Press ↑ or ↓ t
 | Claude Code history | `/claude login` |
 | Codex history | `/codex callback` |
 | Hermes Agent history | `/hermes migration` |
+| Antigravity CLI history and live text | `/antigravity login` (alias `/agy`) |
+| Pi history and live text | `/pi refactor` |
+| Any other detected agent's live text / configured export | `/my-agent login` |
 | Running sessions and live terminals | `/open build` |
 | Folder name/path contains a word | `#website login` |
 | Combine an agent and folder | `/claude #api auth` |
 
-Agent filters select saved histories. With no agent filter, or with `/open`, the helper also searches available live terminal text. Live results and saved history have different visibility: terminal text is limited to what `hc` exposes, and recognizing an open saved session depends on the agent.
+Agent filters select both the corresponding saved history and available live terminal text. `/open` combines with an agent or folder filter. Unknown agents get a generic icon and can be filtered without a code change. Live text is limited to what `hc` exposes; archived formats require a built-in reader or [configured export](docs/agents.md). Detecting every open agent does not imply access to every agent's private historical storage.
 
 <details>
 <summary><b>Actual screenshot</b></summary>
@@ -113,11 +116,14 @@ Search runs locally. It reads supported agent histories, inspects local processe
 | Codex | `$CODEX_HOME/sessions/**/rollout-*.jsonl`, defaulting to `~/.codex` |
 | Codex conversation titles | `session_index.jsonl` in the Codex home |
 | Hermes Agent | `$HERMES_HOME/state.db`, defaulting to `~/.hermes` (opened read-only) |
+| Antigravity CLI | `$ANTIGRAVITY_HOME/conversation_summaries.db`, defaulting to `~/.gemini/antigravity-cli` (native full-text chunks, read-only) |
+| Pi | `$PI_CODING_AGENT_DIR/sessions/*/*.jsonl`, defaulting to `~/.pi/agent` |
+| Additional agents | Normalized JSON/JSONL export paths configured in `~/.config/station-search/sources.json` (`STATION_SEARCH_SOURCES` overrides the config path) |
 | Search index | `~/.cache/station-search/index.db`, overridable with `STATION_SEARCH_DB` |
 
 The index contains searchable conversation text and should be treated as private. Source conversations are not edited. Tool calls, tool output and messages recognized as system injections are excluded from the history index; live terminal text can include whatever is visible in terminal output.
 
-Jumping to a result changes terminal focus. Resuming a result starts `claude --resume`, `codex resume` or `hermes --resume`; those agents use their own normal configuration and services.
+Jumping to a result changes terminal focus. Resuming a result starts its supported agent CLI (`claude --resume`, `codex resume`, `hermes --resume`, `agy --conversation`, or `pi --session`); those agents use their own normal configuration and services. A configured export has no resume command unless you explicitly supply one; otherwise it opens as read-only context.
 
 </details>
 
@@ -126,7 +132,9 @@ Jumping to a result changes terminal focus. Resuming a result starts `claude --r
 
 **Do I need the Station layout?** No. This repository contains the standalone Station Search mod and shortcut snippets.
 
-**Does it search every agent?** Saved-history support is Claude Code, Codex and Hermes Agent. Other terminal output may be searchable as live text, but that does not add a saved-history parser or resume integration for another agent.
+**Does it search every agent?** Any agent exposed by Herdr can be detected and searched through its available live terminal text, including agents added later. Saved-history readers are included for Claude Code, Codex, Hermes Agent, Antigravity CLI and Pi. Use [normalized exports](docs/agents.md) for other historical formats; there is no universal on-disk format shared by all agents.
+
+**Why is an Antigravity conversation missing?** Antigravity CLI must have populated its own `conversations_fts` index. Station Search reads that index's user/agent chunks; it does not decode private protobuf trajectory files or force Antigravity to index them. The desktop IDE's storage is a different format. An open Antigravity terminal remains searchable even if native history indexing is unavailable.
 
 **Why is a running Hermes conversation not marked open?** Hermes can use a shared gateway. The helper needs optional `$HERMES_HOME/agent-hooks/state/<session>.terminal` mappings to associate a session with its terminal. Without them, its saved conversations remain searchable and resumable. See [RECIPE.md](RECIPE.md#watch-out).
 
@@ -134,9 +142,11 @@ Jumping to a result changes terminal focus. Resuming a result starts `claude --r
 
 **Python is installed, but the mod cannot find it.** Verify that `python3` or `python` resolves to Python 3 in the environment used by Herdr. The bundled helper requires SQLite with FTS5 enabled.
 
-**The first query is slow.** It indexes the supported histories first. Time and index size depend on your data; later searches only re-read changed files. Results are bounded: up to 3,000 matching indexed messages are considered and up to 60 conversation groups are selected before folder/open filtering.
+**The first query is slow.** It indexes the supported histories first. Time and index size depend on your data; later searches only re-read changed files (including SQLite WAL updates). Results are bounded: up to 3,000 matching indexed records are considered and up to 60 conversation groups are returned after folder/open filtering. A source that cannot be read is skipped independently and retains its last good indexed data.
 
 **Search is stuck or errors after an update.** Use the latest source, run the native mod check and inspect `herdr-app status`. The current view cancels superseded search tasks and cancels its tasks when closed. Report your Herdr version and relevant errors, without including private conversation content.
+
+The first import can take longer than Herdr's default helper timeout. Queries allow up to ten minutes for indexing; an execution or decoding failure is displayed as a search error instead of “No results”.
 
 **How do I update or remove it?** Review and copy the new mod files, preserving any local modifications. To remove it, close the overlay, remove its shortcut binding and installed mod folder. Its cache is separate; delete the local index only if you intend to discard indexed data.
 

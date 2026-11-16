@@ -10,4 +10,8 @@ Wordmark: “Station Search”. Headline: “Find the conversation. Keep the con
 
 Three supporting columns: “Search locally” / “SQLite full-text index”; “Read in context” / “Preview matching messages”; “Jump or resume” / “Open terminal or past session”. Footer: “Ctrl+Shift+S · Cmd+Shift+S on macOS · EN / ES”. Fine print: “Illustrative interface · sample data”.
 
-Only search features. No project graph, metrics, quotas, task lists, pets, email, meetings, worktrees or deployment features. No real usernames, local machine paths or private conversations. No unsupported Pi/Gemini history integration, cockpit branding or browser chrome.
+Only search features. No project graph, metrics, quotas, task lists, pets, email, meetings, worktrees or deployment features. No real usernames, local machine paths or private conversations, cockpit branding or browser chrome.
+
+## Subtitle update
+
+The built-in image tool edited the original poster with this instruction: Replace only “One search box for Claude Code, Codex, Hermes and open terminals.” with “One search box for all agents and open terminals.” Preserve all other typography, headline, logo, cards, icons, layout, dimensions, sample data, colors, spacing, shadows and fine print. No redesign. The cover's cards are illustrative examples; runtime filters now include discovered agents.

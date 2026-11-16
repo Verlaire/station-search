@@ -1,7 +1,8 @@
 # Station Search
 
-One search box over every coding agent's conversations: Claude Code, Codex and Hermes Agent,
-past and present, plus what's on the screen of every open terminal. Type a few words and the
+One search box for all agents exposed by Herdr and their available terminal text, with built-in
+history readers for Claude Code, Codex, Hermes Agent, Antigravity CLI and Pi, plus configurable
+normalized exports for other agents. Type a few words and the
 sessions that talked about them come up, newest first, with the matching words highlighted.
 Pick one to jump to its terminal if it's running, or resume it in a new tab if it isn't; open
 it inline to read the match in context first.
@@ -20,8 +21,9 @@ change, and the field jumps).
   background belong to a row holding a borderless `Input` (`border_0`) and, inside on the right,
   an EN · ES switch (10.5px semibold on `raised`, the current language on `selected`):
   `Input` has no suffix slot, so the row draws the field.
-- **Filter row**: text chips All · Claude · Codex · Hermes · Open (12px; the picked one on
-  `selected`), then the keys hint flush right in 11px `dim`.
+- **Filter row**: wrapping text chips All, discovered agents (including Antigravity and Pi),
+  and Open (12px; the picked one on `selected`). Put the 11px `dim` keys hint on its own
+  row below, so a growing agent catalog does not squeeze the search field.
 - **Results**: rows 7px tall padding, 8px radius, the picked one on `selected`, hover `hover`.
   Each row: the agent's 16px icon (Herdr's `icons/<agent>.svg`; Hermes' is one color, drawn in
   `foreground`), the title (13px, medium, truncated), an "open" badge (10.5px `accent` on
@@ -33,7 +35,9 @@ change, and the field jumps).
   session". Below, the matched message and two messages either side as cards (10px padding,
   8px radius, 1px `border`); the match's card is on `raised` with an `accent` border and its
   words marked with `<mark>` in `accent` blended 45 % into `popover`. Each card says who wrote
-  it ("You" or the agent) and when, then the message as Markdown, selectable.
+  it ("You" or the agent) and when, then the message as Markdown, selectable. Antigravity's
+  records are native indexed text chunks, potentially containing multiple messages. A configured
+  export without resume argv shows a read-only-history action and stays in preview.
 
 Empty states: a hint before typing, Herdr's `mods/workspace-chrome/spinner.svg` turning in
 `accent` (22px, `.spin(900)`, 28px above and below) while searching, "No results." and,
@@ -42,11 +46,13 @@ without Python 3, what's missing.
 ## How it behaves
 
 - Typing searches after 250 ms. Words are ANDed and prefix-matched; accents and case don't
-  matter ("como" finds "cómo"). `/claude`, `/codex`, `/hermes` keep one agent, `/open` keeps
-  what's running now, `#word` keeps sessions whose folder contains it.
+  matter ("como" finds "cómo"). `/agent-id` keeps any agent, including `/antigravity` (alias
+  `/agy`) and `/pi`; `/open` keeps what's running now, and `#word` keeps matching folders.
+  Agent and Open filters apply together to saved histories and live terminal text.
 - **Click a result or Enter**: a running session focuses its terminal (`agent.focus`); a past one
   resumes in a new tab in its folder (`tab.new {folder, argv}`): `claude --resume <id>`,
-  `codex resume <id>`, `hermes --resume <id>`.
+  `codex resume <id>`, `hermes --resume <id>`, `agy --conversation <id>` or `pi --session <file>`.
+  Configured source argv is optional and is never executed during discovery/indexing.
 - **Chevron or →** opens the conversation; **‹, ← or Esc** goes back. **↑↓** pick a result, or
   scroll the conversation 60px at a time (the wheel too).
 - **Keyboard focus**: while the field has it, ← → move the caret. ↑↓ hand the keyboard to the
@@ -80,12 +86,26 @@ without Python 3, what's missing.
     `session_index.jsonl` (`thread_name`).
   - **Hermes Agent**: `$HERMES_HOME/state.db` (`~/.hermes` by default), tables `sessions` and
     `messages`, read-only.
+  - **Antigravity CLI**: `$ANTIGRAVITY_HOME/conversation_summaries.db` (default
+    `~/.gemini/antigravity-cli`), joining `conversations_fts` user/agent chunks with titles and
+    workspace URIs. Open read-only and include WAL metadata in the incremental stamp. Do not
+    decode private protobuf steps or claim to reconstruct exact messages from chunks.
+  - **Pi**: `$PI_CODING_AGENT_DIR/sessions/*/*.jsonl` (default `~/.pi/agent`), session headers
+    and user/assistant message records. Resume using the session file path.
+  - **Other agents**: discover every live agent via Herdr status metadata, without an allowlist.
+    For saved histories, read explicit normalized JSON/JSONL exports configured by
+    `STATION_SEARCH_SOURCES` or `~/.config/station-search/sources.json`; see
+    [docs/agents.md](docs/agents.md) for the exact schema. Do not pretend to parse arbitrary
+    proprietary databases. Unknown agents have a generic icon.
   - **Live terminals**: `hc ls --json`, `hc get`, `hc read` (screen and scrollback).
   - **Which terminal runs a session**: Claude Code from `~/.claude/sessions/<pid>.json`, walking
     up the process tree (Windows Toolhelp, Linux `/proc`, macOS `ps`) to a terminal's pid; Codex
     by its terminal title's first part matching the thread name; Hermes from optional
     `$HERMES_HOME/agent-hooks/state/<session>.terminal` files (see Watch out).
-  - Commands: `index`, `query <text>`, `context <row> <text>` (the match marked with `\x01` /
+  - Foreground `--conversation` and `--session` flags map Antigravity/Pi histories to open
+    terminals; foreground cwd takes precedence over the launch directory. A broken mapping
+    must not disable live terminal search.
+  - Commands: `agents` (dynamic filter catalog), `index`, `query <text>`, `context <row> <text>` (the match marked with `\x01` /
     `\x02`, two messages either side, long ones trimmed around the match), `lang`.
 - `keys.json`: `ctrl-shift-s` → `mod.open:station-search` (`keys.macos.json`: `cmd-shift-s`).
 - **Dev hooks** (`herdr-app do station-search.<x>`): `query:<text>`, `select:<n>`, `detail`,
@@ -110,6 +130,12 @@ without Python 3, what's missing.
   Hermes sessions are still found and resumed, just never marked open.
 - The first query builds the index (about a minute for a few GB of transcripts); later ones take
   0.3–1.5 s.
+- Timing and index-size figures above describe earlier installations, not a performance guarantee.
+- Each source update uses a savepoint. Locked/invalid sources retain their last good import and
+  warn on stderr while others remain searchable. Include SQLite WAL size/mtime in stamps.
+  Migrate older `sessions` tables by adding nullable resume argv; preserve existing histories.
+- Antigravity must populate its own FTS table first. Missing native indexed conversations and
+  desktop IDE protobuf storage need a separate reader/export; live text remains available.
 
 ## Done when
 
@@ -119,3 +145,8 @@ without Python 3, what's missing.
 - A running session shows "open" and Enter focuses its terminal; a past one opens a new tab
   that resumes it.
 - → shows the conversation with the match marked; ↑↓ scroll it; ← returns.
+- Antigravity and Pi synthetic histories search, preview and produce the right resume argv.
+- An arbitrary future agent exposed by Herdr appears in the filter catalog and live results;
+  `/agent-id /open #folder` narrows those results without leaking other agents into them.
+- Normalized exports work without changing the mod; absent resume argv keeps them read-only.
+- Run `python -I tests/test_search.py -v`: tests use synthetic histories and temporary indexes.
